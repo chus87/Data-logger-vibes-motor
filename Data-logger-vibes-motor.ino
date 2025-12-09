@@ -16,7 +16,7 @@
 #define I2C_SDA_PIN   25   // D25
 #define I2C_SCL_PIN   26   // D26
 
-// UART GPS (lado DERECHO)
+// GPS (UART2, lado DERECHO)
 #define GPS_RX_PIN    16   // RX2
 #define GPS_TX_PIN    17   // TX2
 
@@ -27,7 +27,7 @@
 #define SD_SCK_PIN    18   // D18 (CLK)
 
 // Botón de evento
-#define BUTTON_PIN    15   // D15 (botón entre D15 y GND)
+#define BUTTON_PIN    27   // D27
 
 // LEDs estado GPS
 #define LED_RED_PIN   32   // sin fix
@@ -61,9 +61,6 @@ float offsetAy = 0.0f;
 float offsetAz = 0.0f;
 bool offsetsCalc = false;
 
-// Última orientación válida
-float lastOrientationDeg = 0.0f;
-
 // ===================== FUNCIONES AUXILIARES =====================
 
 void disableRadios() {
@@ -73,11 +70,9 @@ void disableRadios() {
   esp_bt_controller_disable();
 }
 
-// Ahora getGPSData mantiene la última orientación válida en lastOrientationDeg
 void getGPSData(String &dateStr, String &timeStr,
                 double &lat, double &lon,
-                double &speedKmh, int &sats,
-                float &orientationDeg) {
+                double &speedKmh, int &sats) {
   if (gps.date.isValid() && gps.time.isValid()) {
     char bufDate[11];
     snprintf(bufDate, sizeof(bufDate), "%04d-%02d-%02d",
@@ -112,23 +107,15 @@ void getGPSData(String &dateStr, String &timeStr,
   } else {
     sats = 0;
   }
-
-  // Orientación (rumbo) desde el GPS:
-  // si el curso es válido, actualizamos lastOrientationDeg;
-  // si no, reutilizamos la última orientación válida.
-  if (gps.course.isValid()) {
-    lastOrientationDeg = gps.course.deg();
-  }
-  orientationDeg = lastOrientationDeg;
 }
 
-// Siguiente nombre de fichero disponible: log_001.csv, log_002.csv, ...
+// Busca el siguiente nombre libre: /log_001.csv, /log_002.csv, ...
 String getNextLogFilename() {
-  char filename[32];
-  for (int i = 1; i <= 999; i++) {
-    snprintf(filename, sizeof(filename), "/log_%03d.csv", i);
-    if (!SD.exists(filename)) {
-      return String(filename);
+  char name[20];
+  for (int i = 1; i <= 999; ++i) {
+    snprintf(name, sizeof(name), "/log_%03d.csv", i);
+    if (!SD.exists(name)) {
+      return String(name);
     }
   }
   // Si se llenan 999 ficheros, reutiliza el último
@@ -153,7 +140,7 @@ bool initSD() {
     return false;
   }
 
-  // Cabecera (con event, fix y orientation)
+  // Cabecera (nuevo formato con fix y orientation al final)
   logFile.println("millis,gps_date,gps_time,lat,lon,speed_kmh,sats,ax_g,ay_g,az_g,event,fix,orientation");
   logFile.flush();
 
@@ -181,6 +168,7 @@ bool initMPU() {
   return true;
 }
 
+// Calibrar offsets del acelerómetro (caja quieta al inicio)
 void calibrateMPUOffsets() {
   if (!mpuOk) {
     Serial.println("Saltando calibracion: MPU no OK.");
@@ -195,22 +183,29 @@ void calibrateMPUOffsets() {
   for (int i = 0; i < N; ++i) {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
-
     sx += a.acceleration.x / g_const;
     sy += a.acceleration.y / g_const;
     sz += a.acceleration.z / g_const;
-    delay(10);
+    delay(5);
   }
 
   offsetAx = sx / N;
   offsetAy = sy / N;
-  offsetAz = (sz / N) - 1.0f; // esperamos ~1g en Z
-
+  offsetAz = sz / N;
   offsetsCalc = true;
 
-  Serial.print("Offset Ax: "); Serial.println(offsetAx, 4);
-  Serial.print("Offset Ay: "); Serial.println(offsetAy, 4);
-  Serial.print("Offset Az: "); Serial.println(offsetAz, 4);
+  Serial.print("Offsets calculados: Ax=");
+  Serial.print(offsetAx, 4);
+  Serial.print(" Ay=");
+  Serial.print(offsetAy, 4);
+  Serial.print(" Az=");
+  Serial.println(offsetAz, 4);
+}
+
+bool initGPS() {
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("GPS inicializado (UART2 a 9600 baudios).");
+  return true;
 }
 
 // ===================== SETUP =====================
@@ -218,7 +213,7 @@ void calibrateMPUOffsets() {
 void setup() {
   Serial.begin(115200);
   delay(2000);
-
+  Serial.println();
   Serial.println("Iniciando registrador (GPS + MPU6050)...");
 
   disableRadios();
@@ -230,14 +225,16 @@ void setup() {
   digitalWrite(LED_RED_PIN, HIGH);
   digitalWrite(LED_GREEN_PIN, LOW);
 
-  // GPS
-  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  initMPU();
+  if (mpuOk) {
+    calibrateMPUOffsets();
+  }
+  initGPS();
+  sdOk = initSD();   // puede ser false y no pasa nada
 
-  // SD y MPU
-  sdOk  = initSD();
-  mpuOk = initMPU();
-
-  calibrateMPUOffsets();
+  if (!mpuOk) {
+    Serial.println("Advertencia: MPU6050 no inicializado. Se escribiran ceros en ax/ay/az.");
+  }
 
   lastSampleTime = millis();
 }
@@ -282,12 +279,11 @@ void loop() {
       }
     }
 
-    // --- GPS + orientación ---
+    // --- GPS ---
     String dateStr, timeStr;
     double lat, lon, speedKmh;
     int sats;
-    float orientation;
-    getGPSData(dateStr, timeStr, lat, lon, speedKmh, sats, orientation);
+    getGPSData(dateStr, timeStr, lat, lon, speedKmh, sats);
 
     // --- Botón ---
     int buttonState = digitalRead(BUTTON_PIN);
@@ -300,6 +296,9 @@ void loop() {
 
     // --- fix flag (0/1) ---
     int fixFlag = fix ? 1 : 0;
+
+    // --- orientación (placeholder) ---
+    float orientation = 0.0f; // reservado para futuro uso del giroscopio
 
     // Construir línea CSV
     char line[260];
@@ -319,6 +318,7 @@ void loop() {
              fixFlag,
              orientation);
 
+    // Escribir en SD si está
     if (sdOk && logFile) {
       logFile.println(line);
 
@@ -329,6 +329,7 @@ void loop() {
       }
     }
 
+    // Y siempre por serie (para pruebas)
     Serial.println(line);
   }
 }
